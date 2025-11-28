@@ -1,0 +1,311 @@
+name: RDP 24/7 Unlimited
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Auto-restart every 13 days to stay safely within GitHub's 15-day limit
+    - cron: '0 0 */13 * *'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 21600  # 15 days maximum
+
+    steps:
+      - name: Check and Cancel Previous Runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'rdp.yml',
+              status: 'in_progress'
+            });
+            
+            for (const run of runs.data.workflow_runs) {
+              if (run.id !== context.runId) {
+                console.log(`Cancelling previous run: ${run.id}`);
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+              }
+            }
+
+      - name: Configure Core RDP Settings
+        run: |
+          Write-Host "⚙️  Configuring RDP settings..."
+          
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable Network Level Authentication for easier access
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Configure unlimited session times
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "MaxConnectionTime" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "MaxDisconnectionTime" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "MaxIdleTime" -Value 0 -Force
+
+          # Prevent sleep and hibernation
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # Firewall configuration
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+          
+          Write-Host "✓ RDP configured for unlimited sessions"
+
+      - name: Create or Update RDP User
+        run: |
+          Write-Host "👤 Setting up RDP user..."
+          
+          # Use fixed password from secrets or generate new one
+          $storedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"
+          
+          if ([string]::IsNullOrEmpty($storedPassword)) {
+              Add-Type -AssemblyName System.Security
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 5
+              $rawPassword += $charSet.Lower | Get-Random -Count 5
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 2
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
+              
+              Write-Host ""
+              Write-Host "╔════════════════════════════════════════════════╗"
+              Write-Host "║  ⚠️  NEW PASSWORD GENERATED - SAVE THIS NOW! ⚠️  ║"
+              Write-Host "╠════════════════════════════════════════════════╣"
+              Write-Host "║  Add this as 'RDP_FIXED_PASSWORD' secret      ║"
+              Write-Host "║  to keep the same password across restarts    ║"
+              Write-Host "╠════════════════════════════════════════════════╣"
+              Write-Host "║  Password: $password".PadRight(50) + "║"
+              Write-Host "╚════════════════════════════════════════════════╝"
+              Write-Host ""
+          } else {
+              $password = $storedPassword
+              Write-Host "✓ Using persistent password from secrets"
+          }
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Remove user if exists
+          try { 
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue 
+          } catch {}
+          
+          # Create new user
+          New-LocalUser -Name "RDP" -Password $securePass `
+            -AccountNeverExpires -PasswordNeverExpires -Description "GitHub RDP User"
+          
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "❌ User creation failed"
+              exit 1
+          }
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✓ RDP user created successfully"
+
+      - name: Install Tailscale
+        run: |
+          Write-Host "📡 Installing Tailscale..."
+          
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          try {
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 60
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+              Start-Sleep -Seconds 15
+              Write-Host "✓ Tailscale installed"
+          } catch {
+              Write-Error "❌ Tailscale installation failed: $_"
+              exit 1
+          }
+
+      - name: Establish Tailscale Connection
+        run: |
+          Write-Host "🔗 Connecting to Tailscale..."
+          
+          # Use consistent hostname for seamless transitions
+          $hostname = "gh-rdp-247"
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$hostname `
+            --accept-routes `
+            --shields-up=false
+          
+          # Wait for IP assignment with extended retries
+          $tsIP = $null
+          $retries = 0
+          $maxRetries = 40
+          
+          while (-not $tsIP -and $retries -lt $maxRetries) {
+              try {
+                  $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+                  if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
+                      break
+                  } else {
+                      $tsIP = $null
+                  }
+              } catch {}
+              
+              $retries++
+              Write-Host "⏳ Waiting for Tailscale IP... (Attempt $retries/$maxRetries)"
+              Start-Sleep -Seconds 5
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "❌ Tailscale IP not assigned after $maxRetries attempts"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✓ Tailscale connected: $tsIP"
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "🔍 Verifying RDP accessibility..."
+          
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          
+          if (-not $testResult) {
+              Write-Error "❌ RDP port 3389 not accessible"
+              exit 1
+          }
+          
+          Write-Host "✓ RDP port 3389 is accessible"
+
+      - name: Maintain Unlimited Connection
+        run: |
+          $banner = @"
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║           🖥️  RDP 24/7 UNLIMITED ACCESS MODE 🖥️           ║
+║                                                           ║
+╠═══════════════════════════════════════════════════════════╣
+║                                                           ║
+║  📍 Address:  $($env:TAILSCALE_IP.PadRight(43))║
+║  👤 Username: RDP                                         ║
+║  🔑 Password: $($env:RDP_PASSWORD.PadRight(43))║
+║                                                           ║
+╠═══════════════════════════════════════════════════════════╣
+║                                                           ║
+║  ✅ Auto-restart:    Every 13 days                        ║
+║  ♾️  Duration:        UNLIMITED (runs forever)            ║
+║  🔄 Next restart:    Automatic via cron schedule          ║
+║  🛡️  Same password:   Persists across all restarts        ║
+║  📊 Status:          ACTIVE & MONITORING                  ║
+║                                                           ║
+╠═══════════════════════════════════════════════════════════╣
+║                                                           ║
+║  ℹ️  This workflow will restart automatically every       ║
+║     13 days to maintain continuous 24/7 access            ║
+║                                                           ║
+║  💡 To stop: Go to Actions tab and cancel the workflow    ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+"@
+          
+          Write-Host $banner
+          Write-Host ""
+          
+          # Initialize monitoring variables
+          $startTime = Get-Date
+          $checkInterval = 300  # 5 minutes
+          $healthCheckFails = 0
+          $maxHealthCheckFails = 3
+          $nextAutoRestart = $startTime.AddDays(13)
+          
+          Write-Host "🚀 Monitoring started at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "⏰ Next auto-restart scheduled: $($nextAutoRestart.ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host ""
+          
+          # Main monitoring loop - runs indefinitely
+          while ($true) {
+              $now = Get-Date
+              $elapsed = $now - $startTime
+              $days = [math]::Floor($elapsed.TotalDays)
+              $hours = $elapsed.Hours
+              $minutes = $elapsed.Minutes
+              
+              # Calculate time until next restart
+              $timeUntilRestart = $nextAutoRestart - $now
+              $daysLeft = [math]::Floor($timeUntilRestart.TotalDays)
+              $hoursLeft = $timeUntilRestart.Hours
+              
+              # Status display
+              $statusLine = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] " +
+                           "✅ ACTIVE | Uptime: ${days}d ${hours}h ${minutes}m | " +
+                           "Next restart in: ${daysLeft}d ${hoursLeft}h"
+              Write-Host $statusLine
+              
+              # Health check - verify Tailscale is still connected
+              try {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  
+                  if ($tsStatus.BackendState -eq "Running") {
+                      $healthCheckFails = 0
+                      
+                      # Verify IP hasn't changed
+                      $currentIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+                      if ($currentIP -ne $env:TAILSCALE_IP) {
+                          Write-Host "⚠️  IP changed from $env:TAILSCALE_IP to $currentIP"
+                          $env:TAILSCALE_IP = $currentIP
+                      }
+                  } else {
+                      $healthCheckFails++
+                      Write-Warning "⚠️  Tailscale not running (Fail $healthCheckFails/$maxHealthCheckFails)"
+                      
+                      if ($healthCheckFails -ge $maxHealthCheckFails) {
+                          Write-Host "🔄 Attempting to reconnect Tailscale..."
+                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+                          Start-Sleep -Seconds 10
+                          $healthCheckFails = 0
+                      }
+                  }
+              } catch {
+                  Write-Warning "⚠️  Health check exception: $($_.Exception.Message)"
+              }
+              
+              # Periodic system info (every hour)
+              if ($minutes -eq 0) {
+                  $memUsage = Get-WmiObject Win32_OperatingSystem | 
+                              Select-Object @{Name="UsedMemoryGB";Expression={[math]::Round(($_.TotalVisibleMemorySize - $_.FreePhysicalMemory)/1MB,2)}}
+                  Write-Host "💾 Memory usage: $($memUsage.UsedMemoryGB) GB"
+              }
+              
+              Start-Sleep -Seconds $checkInterval
+          }
+"@
+
+          Invoke-Expression $banner
